@@ -66,3 +66,13 @@ public InputStream streamLogs(PodLogFilter filter) throws IOException {
 
     return pipedIn;
 }
+
+
+private boolean isWithinWindow(String line, Instant start, Instant end) {
+    try {
+        Instant ts = Instant.parse(line.split(" ")[0]);
+        return !ts.isBefore(start) && ts.isBefore(end);
+    } catch (Exception e) {
+        return false;
+    }
+                }
