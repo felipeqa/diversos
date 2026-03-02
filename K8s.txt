@@ -1,0 +1,164 @@
+Exatamente. Para logs de dias, o usuário ficaria travado minutos ou até horas. Por isso a solução certa para esse cenário é o job assíncrono que discutimos antes — que é a única forma de combinar "todo o log" + "sem travar o usuário" + "sem mudar infra".Fluxo completo revisitado1. Usuário clica "Baixar log completo"
+        ↓
+2. POST /logs/export → retorna jobId imediatamente (< 1 segundo)
+        ↓
+3. Frontend mostra progresso (polling ou SSE)
+        ↓
+4. Backend processa em background (chunks sequenciais)
+        ↓
+5. Quando pronto → botão "Download disponível" aparece
+        ↓
+6. GET /logs/export/{jobId}/download → baixa o .gz já prontoBackend completo@Service
+public class LogExportService {
+
+    private final Map<String, ExportJob> jobs = new ConcurrentHashMap<>();
+    private final PodLogs podLogs; // seu client atual
+
+    @Async("logDownloadExecutor")
+    public void processExport(String jobId, String namespace, 
+                               String name, String container) {
+        ExportJob job = jobs.get(jobId);
+        job.setStatus("PROCESSING");
+
+        Path outputFile = Path.of("/tmp/" + jobId + ".log.gz");
+
+        try {
+            int totalSeconds = getPodAgeInSeconds(namespace, name);
+            int windowSeconds = 30 * 60; // 30 min por chunk
+            int totalWindows = (int) Math.ceil((double) totalSeconds / windowSeconds);
+            int processed = 0;
+
+            try (GZIPOutputStream gzip = new GZIPOutputStream(
+                    Files.newOutputStream(outputFile), 256 * 1024)) {
+
+                int cursor = totalSeconds;
+                while (cursor > 0) {
+                    try (InputStream chunk = podLogs.streamNamespacedPodLog(
+                            namespace, name, container,
+                            cursor, null, false)) {
+                        chunk.transferTo(gzip);
+                    }
+                    cursor -= windowSeconds;
+                    processed++;
+
+                    // Atualiza progresso
+                    int progress = (processed * 100) / totalWindows;
+                    job.setProgress(progress);
+                }
+
+                gzip.finish();
+            }
+
+            job.setStatus("DONE");
+            job.setFilePath(outputFile.toString());
+
+        } catch (Exception e) {
+            job.setStatus("ERROR");
+            job.setError(e.getMessage());
+        }
+    }
+
+    public ExportJob getJob(String jobId) {
+        return jobs.get(jobId);
+    }
+
+    public ExportJob createJob(String namespace, String name, String container) {
+        String jobId = UUID.randomUUID().toString();
+        ExportJob job = new ExportJob(jobId, namespace, name, container);
+        jobs.put(jobId, job);
+        return job;
+    }
+}@RestController
+@RequestMapping("/api/logs")
+public class LogExportController {
+
+    private final LogExportService exportService;
+
+    // 1. Dispara o job
+    @PostMapping("/export/{namespace}/{name}/{container}")
+    public ResponseEntity<ExportJob> startExport(
+            @PathVariable String namespace,
+            @PathVariable String name,
+            @PathVariable String container) {
+
+        ExportJob job = exportService.createJob(namespace, name, container);
+        exportService.processExport(job.getJobId(), namespace, name, container);
+        return ResponseEntity.accepted().body(job);
+    }
+
+    // 2. Consulta progresso
+    @GetMapping("/export/{jobId}/status")
+    public ResponseEntity<ExportJob> getStatus(@PathVariable String jobId) {
+        return ResponseEntity.ok(exportService.getJob(jobId));
+    }
+
+    // 3. Baixa quando pronto
+    @GetMapping("/export/{jobId}/download")
+    public ResponseEntity<StreamingResponseBody> download(@PathVariable String jobId) {
+        ExportJob job = exportService.getJob(jobId);
+
+        if (!"DONE".equals(job.getStatus())) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).build();
+        }
+
+        StreamingResponseBody stream = out -> {
+            try (InputStream is = Files.newInputStream(Path.of(job.getFilePath()))) {
+                is.transferTo(out);
+            } finally {
+                Files.deleteIfExists(Path.of(job.getFilePath())); // limpa após download
+            }
+        };
+
+        return ResponseEntity.ok()
+            .header(HttpHeaders.CONTENT_DISPOSITION,
+                    "attachment; filename=" + job.getName() + ".log.gz")
+            .contentType(MediaType.APPLICATION_OCTET_STREAM)
+            .body(stream);
+    }
+}Frontend Angular — botão com progresso// 1. Dispara e começa polling
+downloadFullLog(namespace: string, pod: string, container: string) {
+  this.isExporting.set(true);
+  this.exportProgress.set(0);
+
+  this.http.post<ExportJob>(`/api/logs/export/${namespace}/${pod}/${container}`, {})
+    .subscribe(job => this.pollStatus(job.jobId));
+}
+
+// 2. Polling a cada 3 segundos
+private pollStatus(jobId: string) {
+  interval(3000).pipe(
+    switchMap(() => this.http.get<ExportJob>(`/api/logs/export/${jobId}/status`)),
+    takeWhile(job => job.status === 'PROCESSING', true)
+  ).subscribe(job => {
+    this.exportProgress.set(job.progress);
+
+    if (job.status === 'DONE') {
+      this.isExporting.set(false);
+      this.readyJobId.set(jobId); // habilita botão de download
+    }
+    if (job.status === 'ERROR') {
+      this.isExporting.set(false);
+      // mostra erro
+    }
+  });
+}<!-- Botão adaptativo -->
+@if (!isExporting() && !readyJobId()) {
+  <button (click)="downloadFullLog(ns, pod, container)">
+    <mat-icon>download</mat-icon> Baixar log completo
+  </button>
+}
+
+@if (isExporting()) {
+  <div>
+    <mat-progress-bar [value]="exportProgress()" />
+    <span>Preparando log... {{ exportProgress() }}%</span>
+  </div>
+}
+
+@if (readyJobId()) {
+  <a [href]="'/api/logs/export/' + readyJobId() + '/download'">
+    <button mat-raised-button color="primary">
+      <mat-icon>download</mat-icon> Download pronto — clique para baixar
+    </button>
+  </a>
+}Essa é a única abordagem que resolve os três requisitos simultaneamente: todo o log + usuário livre para navegar + sem mudar infra.
